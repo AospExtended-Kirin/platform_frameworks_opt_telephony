@@ -53,6 +53,7 @@ import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.telephony.euicc.EuiccController;
 import com.android.internal.telephony.uicc.IccRecords;
 import com.android.internal.telephony.uicc.IccUtils;
+import com.android.internal.os.BackgroundThread;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
@@ -108,10 +109,11 @@ public class SubscriptionInfoUpdater extends Handler {
 
     private static Phone[] mPhone;
     private static Context mContext = null;
-    private static String mIccId[] = new String[PROJECT_SIM_NUM];
+    protected static String mIccId[] = new String[PROJECT_SIM_NUM];
     private static int[] mInsertSimState = new int[PROJECT_SIM_NUM];
     private static int[] sSimCardState = new int[PROJECT_SIM_NUM];
     private static int[] sSimApplicationState = new int[PROJECT_SIM_NUM];
+    private boolean[] mIsRecordLoaded = new boolean[PROJECT_SIM_NUM];
     private SubscriptionManager mSubscriptionManager = null;
     private EuiccManager mEuiccManager;
     private IPackageManager mPackageManager;
@@ -122,6 +124,13 @@ public class SubscriptionInfoUpdater extends Handler {
 
     public SubscriptionInfoUpdater(
             Looper looper, Context context, Phone[] phone, CommandsInterface[] ci) {
+        this(looper, context, phone, ci,
+                IPackageManager.Stub.asInterface(ServiceManager.getService("package")));
+    }
+
+    @VisibleForTesting public SubscriptionInfoUpdater(
+            Looper looper, Context context, Phone[] phone,
+            CommandsInterface[] ci, IPackageManager packageMgr) {
         super(looper);
         logd("Constructor invoked");
 
@@ -129,10 +138,19 @@ public class SubscriptionInfoUpdater extends Handler {
         mPhone = phone;
         mSubscriptionManager = SubscriptionManager.from(mContext);
         mEuiccManager = (EuiccManager) mContext.getSystemService(Context.EUICC_SERVICE);
-        mPackageManager = IPackageManager.Stub.asInterface(ServiceManager.getService("package"));
+        mPackageManager = packageMgr;
 
         mCarrierServiceBindHelper = new CarrierServiceBindHelper(mContext);
         initializeCarrierApps();
+
+        for (int index = 0; index < PROJECT_SIM_NUM; index++) {
+            mIsRecordLoaded[index] = false;
+        }
+    }
+
+    public SubscriptionInfoUpdater(Context context, Phone[] phone, CommandsInterface[] ci) {
+        this(BackgroundThread.get().getLooper(), context, phone, ci);
+
     }
 
     private void initializeCarrierApps() {
@@ -194,7 +212,7 @@ public class SubscriptionInfoUpdater extends Handler {
         }
     }
 
-    private boolean isAllIccIdQueryDone() {
+    protected boolean isAllIccIdQueryDone() {
         for (int i = 0; i < PROJECT_SIM_NUM; i++) {
             if (mIccId[i] == null) {
                 logd("Wait for SIM" + (i + 1) + " IccId");
@@ -295,7 +313,7 @@ public class SubscriptionInfoUpdater extends Handler {
         sendMessage(obtainMessage(EVENT_REFRESH_EMBEDDED_SUBSCRIPTIONS, callback));
     }
 
-    private void handleSimLocked(int slotId, String reason) {
+    protected void handleSimLocked(int slotId, String reason) {
         if (mIccId[slotId] != null && mIccId[slotId].equals(ICCID_STRING_FOR_NO_SIM)) {
             logd("SIM" + (slotId + 1) + " hot plug in");
             mIccId[slotId] = null;
@@ -348,7 +366,7 @@ public class SubscriptionInfoUpdater extends Handler {
         }
     }
 
-    private void handleSimLoaded(int slotId) {
+    protected void handleSimLoaded(int slotId) {
         logd("handleSimLoaded: slotId: " + slotId);
 
         // The SIM should be loaded at this state, but it is possible in cases such as SIM being
@@ -370,17 +388,16 @@ public class SubscriptionInfoUpdater extends Handler {
             return;
         }
         mIccId[slotId] = IccUtils.stripTrailingFs(records.getFullIccId());
+        mIsRecordLoaded[slotId] = true;
 
         if (isAllIccIdQueryDone()) {
             updateSubscriptionInfoByIccId();
             int[] subIds = mSubscriptionManager.getActiveSubscriptionIdList();
             for (int subId : subIds) {
-                TelephonyManager tm = TelephonyManager.getDefault();
-
-                String operator = tm.getSimOperatorNumeric(subId);
                 slotId = SubscriptionController.getInstance().getPhoneId(subId);
+                String operator = mPhone[slotId].getOperatorNumeric();
 
-                if (!TextUtils.isEmpty(operator)) {
+                if (operator != null && !TextUtils.isEmpty(operator)) {
                     if (subId == SubscriptionController.getInstance().getDefaultSubId()) {
                         MccTable.updateMccMncConfiguration(mContext, operator, false);
                     }
@@ -389,6 +406,7 @@ public class SubscriptionInfoUpdater extends Handler {
                     logd("EVENT_RECORDS_LOADED Operator name is null");
                 }
 
+                TelephonyManager tm = TelephonyManager.getDefault();
                 String msisdn = tm.getLine1Number(subId);
                 ContentResolver contentResolver = mContext.getContentResolver();
 
@@ -405,7 +423,7 @@ public class SubscriptionInfoUpdater extends Handler {
                     if (!TextUtils.isEmpty(simCarrierName)) {
                         nameToSet = simCarrierName;
                     } else {
-                        nameToSet = "CARD " + Integer.toString(slotId + 1);
+                        nameToSet = "SIM " + Integer.toString(slotId + 1);
                     }
                     logd("sim name = " + nameToSet);
                     SubscriptionController.getInstance().setDisplayName(nameToSet, subId);
@@ -452,18 +470,22 @@ public class SubscriptionInfoUpdater extends Handler {
                     editor.putInt(CURR_SUBID + slotId, subId);
                     editor.apply();
                 }
+
+                // Update set of enabled carrier apps now that the privilege rules may have changed.
+                CarrierAppUtils.disableCarrierAppsUntilPrivileged(mContext.getOpPackageName(),
+                        mPackageManager, TelephonyManager.getDefault(),
+                        mContext.getContentResolver(), mCurrentlyActiveUserId);
+
+                if (mIsRecordLoaded[slotId] == true) {
+                    broadcastSimStateChanged(slotId, IccCardConstants.
+                            INTENT_VALUE_ICC_LOADED, null);
+                    broadcastSimCardStateChanged(slotId, TelephonyManager.SIM_STATE_PRESENT);
+                    broadcastSimApplicationStateChanged(slotId, TelephonyManager.SIM_STATE_LOADED);
+                    updateCarrierServices(slotId, IccCardConstants.INTENT_VALUE_ICC_LOADED);
+                    mIsRecordLoaded[slotId] = false;
+                }
             }
         }
-
-        // Update set of enabled carrier apps now that the privilege rules may have changed.
-        CarrierAppUtils.disableCarrierAppsUntilPrivileged(mContext.getOpPackageName(),
-                mPackageManager, TelephonyManager.getDefault(),
-                mContext.getContentResolver(), mCurrentlyActiveUserId);
-
-        broadcastSimStateChanged(loadedSlotId, IccCardConstants.INTENT_VALUE_ICC_LOADED, null);
-        broadcastSimCardStateChanged(loadedSlotId, TelephonyManager.SIM_STATE_PRESENT);
-        broadcastSimApplicationStateChanged(loadedSlotId, TelephonyManager.SIM_STATE_LOADED);
-        updateCarrierServices(loadedSlotId, IccCardConstants.INTENT_VALUE_ICC_LOADED);
     }
 
     private void updateCarrierServices(int slotId, String simState) {
@@ -473,9 +495,9 @@ public class SubscriptionInfoUpdater extends Handler {
         mCarrierServiceBindHelper.updateForPhoneId(slotId, simState);
     }
 
-    private void handleSimAbsent(int slotId) {
+    protected void handleSimAbsent(int slotId) {
         if (mIccId[slotId] != null && !mIccId[slotId].equals(ICCID_STRING_FOR_NO_SIM)) {
-            logd("SIM" + (slotId + 1) + " hot plug out");
+            logd("SIM" + (slotId + 1) + " hot plug out or error.");
         }
         mIccId[slotId] = ICCID_STRING_FOR_NO_SIM;
         if (isAllIccIdQueryDone()) {
@@ -487,7 +509,7 @@ public class SubscriptionInfoUpdater extends Handler {
         broadcastSimApplicationStateChanged(slotId, TelephonyManager.SIM_STATE_NOT_READY);
     }
 
-    private void handleSimError(int slotId) {
+    protected void handleSimError(int slotId) {
         if (mIccId[slotId] != null && !mIccId[slotId].equals(ICCID_STRING_FOR_NO_SIM)) {
             logd("SIM" + (slotId + 1) + " Error ");
         }
@@ -506,7 +528,7 @@ public class SubscriptionInfoUpdater extends Handler {
      * TODO: Simplify more, as no one is interested in what happened
      * only what the current list contains.
      */
-    synchronized private void updateSubscriptionInfoByIccId() {
+    synchronized protected void updateSubscriptionInfoByIccId() {
         logd("updateSubscriptionInfoByIccId:+ Start");
 
         for (int i = 0; i < PROJECT_SIM_NUM; i++) {

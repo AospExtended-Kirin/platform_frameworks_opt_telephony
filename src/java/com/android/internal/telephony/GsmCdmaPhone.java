@@ -1682,7 +1682,13 @@ public class GsmCdmaPhone extends Phone {
         Message resp;
         mVmNumber = voiceMailNumber;
         resp = obtainMessage(EVENT_SET_VM_NUMBER_DONE, 0, 0, onComplete);
+
         IccRecords r = mIccRecords.get();
+
+        if (!isPhoneTypeGsm() && mSimRecords != null) {
+            r = mSimRecords;
+        }
+
         if (r != null) {
             r.setVoiceMailNumber(alphaTag, mVmNumber, resp);
         }
@@ -2654,6 +2660,7 @@ public class GsmCdmaPhone extends Phone {
                 }
                 mUiccApplication.set(newUiccApplication);
                 mIccRecords.set(newUiccApplication.getIccRecords());
+                logd("mIccRecords = " + mIccRecords);
                 registerForIccRecordEvents();
                 mIccPhoneBookIntManager.updateIccRecords(mIccRecords.get());
             }
@@ -3268,7 +3275,7 @@ public class GsmCdmaPhone extends Phone {
         }
     }
 
-    private void phoneObjectUpdater(int newVoiceRadioTech) {
+    protected void phoneObjectUpdater(int newVoiceRadioTech) {
         logd("phoneObjectUpdater: newVoiceRadioTech=" + newVoiceRadioTech);
 
         // Check for a voice over lte replacement
@@ -3453,6 +3460,8 @@ public class GsmCdmaPhone extends Phone {
         pw.println("GsmCdmaPhone extends:");
         super.dump(fd, pw, args);
         pw.println(" mPrecisePhoneType=" + mPrecisePhoneType);
+        pw.println(" mSimRecords=" + mSimRecords);
+        pw.println(" mIsimUiccRecords=" + mIsimUiccRecords);
         pw.println(" mCT=" + mCT);
         pw.println(" mSST=" + mSST);
         pw.println(" mPendingMMIs=" + mPendingMMIs);
@@ -3508,7 +3517,8 @@ public class GsmCdmaPhone extends Phone {
     /**
      * @return operator numeric.
      */
-    private String getOperatorNumeric() {
+    @Override
+    public String getOperatorNumeric() {
         String operatorNumeric = null;
         if (isPhoneTypeGsm()) {
             IccRecords r = mIccRecords.get();
